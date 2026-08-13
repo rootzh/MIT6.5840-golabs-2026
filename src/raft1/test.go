@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Test struct {
@@ -311,7 +311,7 @@ func (ts *Test) one(cmd any, expectedServers int, retry bool) int {
 				ts.srvs[starts].mu.Unlock()
 			}
 			if rf != nil {
-				// log.Printf("peer %d Start %v rf %v", starts, cmd, rf)
+				// fmt.Printf("peer %d Start %v rf %v", starts, cmd, rf)
 				index1, _, ok := rf.Start(cmd)
 				if ok {
 					index = index1
@@ -326,6 +326,7 @@ func (ts *Test) one(cmd any, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := ts.nCommitted(index)
+				// fmt.Printf("peer %d Start %v rf %v\n", index, nd, cmd)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {
