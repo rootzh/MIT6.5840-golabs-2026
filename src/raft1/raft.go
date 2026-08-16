@@ -12,7 +12,6 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
-	"slices"
 	"sync"
 	"time"
 
@@ -32,8 +31,8 @@ const (
 )
 
 type LogEntry struct {
-	Term    uint64
-	Index   uint64
+	Term    int
+	Index   int
 	Command interface{}
 }
 
@@ -51,22 +50,25 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	// Persistent state on all servers
-	currentTerm uint64
+	currentTerm int
 	votedFor    int
 	log         []LogEntry
 
 	// Volatile state on all servers
-	commitIndex     uint64
-	lastApplied     uint64
+	commitIndex     int
+	lastApplied     int
 	leader          int
 	state           ServerState
 	lastRecivedTime time.Time
 	electionTimeout time.Duration
 
 	// Volatile state on leaders
-	nextIndex           []uint64
-	matchIndex          []uint64
+	nextIndex           []int
+	matchIndex          []int
 	lastSendAppendEntry []time.Time
+
+	snapshot  []byte
+	startTime time.Time
 }
 
 func (rf *Raft) becomeLeaderWithLocked() {
@@ -74,21 +76,22 @@ func (rf *Raft) becomeLeaderWithLocked() {
 		return
 	}
 	tester.Annotate(fmt.Sprintf("Server %d", rf.me), "become leader", fmt.Sprintf("term: %v", rf.currentTerm))
-	lastLog := rf.log[len(rf.log)-1]
+	// fmt.Printf("server:%d become leader term: %v, since:%v\n", rf.me, rf.currentTerm, time.Since(rf.startTime))
+	lastLogIndex, _ := rf.getLastLogIndexAndTermWithLocked()
 	for server := range rf.peers {
 		if server == rf.me {
 			continue
 		}
-		rf.nextIndex[server] = lastLog.Index + 1
+		rf.nextIndex[server] = lastLogIndex + 1
 		rf.matchIndex[server] = 0
 		rf.lastSendAppendEntry[server] = time.Now().Add(-24 * time.Hour)
 	}
 	rf.state = Leader
-	rf.sendHeatbeatWithLocked()
+	rf.sendHeatbeatWithLocked(true)
 	// tester.Annotate(fmt.Sprintf("Server %d", rf.me), "become leader end", fmt.Sprintf("term: %v", rf.currentTerm))
 }
 
-func (rf *Raft) checkAndMaySetTermAndStateWithLocked(term uint64) {
+func (rf *Raft) checkAndMaySetTermAndStateWithLocked(term int) {
 	if rf.currentTerm < term {
 		rf.currentTerm = term
 		rf.votedFor = -1
@@ -129,7 +132,12 @@ func (rf *Raft) persist() {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+
+	if rf.snapshot != nil {
+		rf.persister.Save(raftstate, rf.snapshot)
+	} else {
+		rf.persister.Save(raftstate, nil)
+	}
 }
 
 // restore previously persisted state.
@@ -141,7 +149,7 @@ func (rf *Raft) readPersist(data []byte) {
 	// Example:
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var term uint64
+	var term int
 	var voteFor int
 	var logs []LogEntry
 	if d.Decode(&term) != nil ||
@@ -168,6 +176,21 @@ func (rf *Raft) PersistBytes() int {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index > rf.commitIndex {
+		return
+	}
+	if (rf.snapshot != nil && index <= rf.log[0].Index) ||
+		len(rf.log) == 0 ||
+		index > rf.log[len(rf.log)-1].Index {
+		return
+	}
+	logIndex := index - rf.log[0].Index
+	rf.snapshot = snapshot
+	rf.log = rf.log[logIndex:]
+	rf.applyCond.Signal()
+	rf.sendHeatbeatWithLocked(true)
 
 }
 
@@ -175,18 +198,23 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
-	Term         uint64
+	Term         int
 	CandidateId  int
-	LastLogIndex uint64
-	LastLogTerm  uint64
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
-	Term        uint64
+	Term        int
 	VoteGranted bool
+}
+
+func (rf *Raft) getLastLogIndexAndTermWithLocked() (int, int) {
+	lastLog := rf.log[len(rf.log)-1]
+	return lastLog.Index, lastLog.Term
 }
 
 // example RequestVote RPC handler.
@@ -205,9 +233,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.checkAndMaySetTermAndStateWithLocked(args.Term)
 	}
 
-	lastLog := rf.log[len(rf.log)-1]
-	if args.LastLogTerm < lastLog.Term || (args.LastLogTerm == lastLog.Term && args.LastLogIndex < lastLog.Index) {
-		tester.Annotate(fmt.Sprintf("Server %d", rf.me), "log not match", fmt.Sprintf("request:%d, currentTerm:%d, args term:%d, args log:%d-%d, current log:%d-%d, state:%d", args.CandidateId, rf.currentTerm, args.Term, args.LastLogIndex, args.LastLogTerm, lastLog.Index, lastLog.Term, rf.state))
+	lastLogIndex, lastLogTerm := rf.getLastLogIndexAndTermWithLocked()
+	if args.LastLogTerm < lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
+		tester.Annotate(fmt.Sprintf("Server %d", rf.me), "log not match", fmt.Sprintf("request:%d, currentTerm:%d, args term:%d, args log:%d-%d, current log:%d-%d, state:%d", args.CandidateId, rf.currentTerm, args.Term, args.LastLogIndex, args.LastLogTerm, lastLogIndex, lastLogTerm, rf.state))
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
@@ -256,26 +284,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	tester.Annotate(fmt.Sprintf("Server %d", rf.me), "send request vote begin", fmt.Sprintf("to server:%d, args:%+v, reply:%+v", server, args, reply))
+	// fmt.Printf("sendRequstVote to server:%d, args:%+v, reply:%+v\n", server, args, reply)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
 type AppendEntryArgs struct {
-	Term         uint64
+	Term         int
 	LeaderId     int
-	PrevLogIndex uint64
-	PrevLogTerm  uint64
+	PrevLogIndex int
+	PrevLogTerm  int
 	Entries      []LogEntry
-	LeaderCommit uint64
+	LeaderCommit int
 }
 
 type AppendEntryReply struct {
-	Term    uint64
+	Term    int
 	Success bool
 
-	XTerm  uint64 // term in the conflicting entry (if any)
-	XIndex uint64 //index of first entry with that term (if any)
-	XLen   int    // log length
+	XTerm  int // term in the conflicting entry (if any)
+	XIndex int //index of first entry with that term (if any)
+	XLen   int // log length
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
@@ -287,6 +316,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.Success = false
 		return
 	}
+	// fmt.Printf("reciver append entry server:%d, from:%d, time:%v\n", rf.me, args.LeaderId, time.Now().UnixMilli())
 	rf.lastRecivedTime = time.Now()
 	rf.checkAndMaySetTermAndStateWithLocked(args.Term)
 	if rf.state != Follower {
@@ -294,28 +324,40 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.state = Follower
 	}
 
-	preLogIndex := args.PrevLogIndex - rf.log[0].Index
-	if preLogIndex >= uint64(len(rf.log)) {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		reply.XTerm = 1
-		reply.XIndex = 1
-		reply.XLen = len(rf.log)
-		return
-	}
-	if rf.log[preLogIndex].Term != args.PrevLogTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		reply.XTerm = rf.log[preLogIndex].Term
-		reply.XIndex = 1
-		for index := preLogIndex; index > 0; index-- {
-			if rf.log[index].Term != rf.log[preLogIndex].Term {
-				reply.XIndex = rf.log[index+1].Index
-				break
-			}
+	preLogIndex := 0
+	if args.PrevLogIndex < rf.log[0].Index {
+		endIndex := args.PrevLogIndex + len(args.Entries)
+		if endIndex > rf.log[0].Index {
+			leftLen := endIndex - rf.log[0].Index
+			args.Entries = args.Entries[len(args.Entries)-leftLen:]
+			preLogIndex = args.Entries[0].Index - rf.log[0].Index - 1
+		} else {
+			args.Entries = []LogEntry{}
 		}
-		reply.XLen = len(rf.log)
-		return
+	} else {
+		preLogIndex = args.PrevLogIndex - rf.log[0].Index
+		if preLogIndex >= len(rf.log) {
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			reply.XTerm = -1
+			reply.XIndex = -1
+			reply.XLen = rf.log[len(rf.log)-1].Index
+			return
+		}
+		if rf.log[preLogIndex].Term != args.PrevLogTerm {
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			reply.XTerm = rf.log[preLogIndex].Term
+			reply.XIndex = rf.log[0].Index
+			for index := preLogIndex; index >= 0; index-- {
+				if rf.log[index].Term != rf.log[preLogIndex].Term {
+					reply.XIndex = rf.log[index+1].Index
+					break
+				}
+			}
+			reply.XLen = rf.log[len(rf.log)-1].Index
+			return
+		}
 	}
 	// tester.Annotate(fmt.Sprintf("Server %d", rf.me), "Append Entry 1", fmt.Sprintf("term:%d-%d-%d, state:%d, cost:%v", rf.currentTerm, args.Term, reply.Term, rf.state, time.Since(start)))
 	if len(args.Entries) > 0 {
@@ -324,7 +366,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		argsLogIndex := -1
 		needPersist := false
 		for index, entry := range args.Entries {
-			if curLogIndex >= uint64(len(rf.log)) {
+			if curLogIndex >= len(rf.log) {
 				break
 			}
 			if rf.log[curLogIndex].Index != entry.Index || rf.log[curLogIndex].Term != entry.Term {
@@ -359,9 +401,93 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
 	// tester.Annotate(fmt.Sprintf("Server %d", rf.me), "send appendentry begin", fmt.Sprintf("to server:%d, args:%+v, reply:%+v", server, args, reply))
+	// fmt.Printf("server:%d send AppendEntry to server:%d, args:%+v, reply:%+v, time:%v, since:%v\n", rf.me, server, args, reply, time.Now().UnixMilli(), time.Since(rf.startTime))
 	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
 	// tester.Annotate(fmt.Sprintf("Server %d", rf.me), "send appendentry end", fmt.Sprintf("to server:%d, ok:%v, args:%+v, reply:%+v", server, ok, args, reply))
 	return ok
+}
+
+type Snapshot struct {
+	LastIncludeLogIndex int
+	LastIncludeLogTerm  int
+	Data                []byte
+}
+type InstallSnapshotArgs struct {
+	Term     int // leader’s term
+	LeaderId int // so follower can redirect clients
+	Snapshot Snapshot
+}
+
+type InstallSnapshotReply struct {
+	Term int // currentTerm, for leader to update itself
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		return
+	}
+	rf.lastRecivedTime = time.Now()
+	if args.Snapshot.LastIncludeLogIndex <= rf.log[0].Index {
+		return
+	}
+	logIndex := args.Snapshot.LastIncludeLogIndex - rf.log[0].Index
+	if args.Snapshot.LastIncludeLogIndex >= rf.log[len(rf.log)-1].Index || rf.log[logIndex].Term != args.Snapshot.LastIncludeLogTerm {
+		rf.log = rf.log[0:1]
+		rf.log[0] = LogEntry{
+			Index:   args.Snapshot.LastIncludeLogIndex,
+			Term:    args.Snapshot.LastIncludeLogTerm,
+			Command: nil,
+		}
+		rf.commitIndex = max(rf.commitIndex, rf.log[0].Index)
+		rf.snapshot = args.Snapshot.Data
+		rf.applyCond.Signal()
+		return
+	}
+	rf.log = rf.log[logIndex:]
+	rf.snapshot = args.Snapshot.Data
+	rf.leader = args.LeaderId
+	rf.commitIndex = max(rf.commitIndex, rf.log[0].Index)
+	rf.applyCond.Signal()
+	rf.persist()
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) reqeustInstallSnapshot(server int) {
+	rf.mu.Lock()
+	args := InstallSnapshotArgs{
+		Term:     rf.currentTerm,
+		LeaderId: rf.me,
+		Snapshot: Snapshot{
+			LastIncludeLogIndex: rf.log[0].Index,
+			LastIncludeLogTerm:  rf.log[0].Term,
+			Data:                rf.snapshot,
+		},
+	}
+	rf.mu.Unlock()
+	reply := InstallSnapshotReply{}
+	ok := rf.sendInstallSnapshot(server, &args, &reply)
+	if !ok {
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term != rf.currentTerm || rf.state != Leader {
+		return
+	}
+	if reply.Term > rf.currentTerm {
+		rf.checkAndMaySetTermAndStateWithLocked(reply.Term)
+	} else {
+		rf.nextIndex[server] = max(rf.nextIndex[server], args.Snapshot.LastIncludeLogIndex+1)
+		rf.matchIndex[server] = max(rf.matchIndex[server], args.Snapshot.LastIncludeLogIndex)
+		rf.sendHeatbeatWithLocked(true)
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -382,16 +508,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.state != Leader {
 		return 0, 0, false
 	}
-	lastLog := rf.log[len(rf.log)-1]
+	lastLogIndex := rf.log[len(rf.log)-1].Index
 	rf.log = append(rf.log, LogEntry{
-		Index:   lastLog.Index + 1,
+		Index:   lastLogIndex + 1,
 		Term:    rf.currentTerm,
 		Command: command,
 	})
 	rf.persist()
-	tester.Annotate(fmt.Sprintf("Server %d", rf.me), "write entry", fmt.Sprintf("log index:%d, entry:%+v", lastLog.Index+1, command))
+	tester.Annotate(fmt.Sprintf("Server %d", rf.me), "write entry", fmt.Sprintf("log index:%d, entry:%+v", lastLogIndex+1, command))
+	rf.sendHeatbeatWithLocked(false)
 
-	return int(lastLog.Index) + 1, int(rf.currentTerm), rf.state == Leader
+	// fmt.Printf("server:%d, write log:%d, since:%v\n", rf.me, lastLogIndex+1, time.Since(rf.startTime))
+	return lastLogIndex + 1, rf.currentTerm, rf.state == Leader
 }
 
 func calcCost(start time.Time) time.Duration {
@@ -400,12 +528,13 @@ func calcCost(start time.Time) time.Duration {
 
 func (rf *Raft) startVoteWithLocked() {
 	tester.Annotate(fmt.Sprintf("Server %d", rf.me), "start vote", fmt.Sprintf("start vote, term:%d, lastRecivedTime:%v, electionTimeout:%v", rf.currentTerm, time.Since(rf.lastRecivedTime), rf.electionTimeout))
-	lastLog := rf.log[len(rf.log)-1]
+	// fmt.Printf("server:%d, start vote, term:%d, lastRecivedTime:%v, electionTimeout:%v, since:%v\n", rf.me, rf.currentTerm, time.Since(rf.lastRecivedTime), rf.electionTimeout, time.Since(rf.startTime))
+	lastLogIndex, lastLogTerm := rf.getLastLogIndexAndTermWithLocked()
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: lastLog.Index,
-		LastLogTerm:  lastLog.Term,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
 	}
 	voteGrantedCount := 1
 	for server := range rf.peers {
@@ -455,46 +584,74 @@ func (rf *Raft) ticker() {
 				rf.persist()
 				rf.startVoteWithLocked()
 				rf.lastRecivedTime = time.Now()
+				rf.resetElectTimeoutWithLocked()
 			}
 			rf.mu.Unlock()
 		}
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		ms := 50 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
 func (rf *Raft) applyLog() {
-	logStartIndex := 0
-	logEndIndex := 0
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	for true {
-		if rf.lastApplied >= rf.commitIndex {
+		// start := time.Now()
+		if rf.lastApplied >= rf.commitIndex && rf.lastApplied >= rf.log[0].Index {
 			rf.applyCond.Wait()
 		}
-		logStartIndex = int(rf.lastApplied)
-		logEndIndex = int(rf.commitIndex)
-		copyLog := slices.Clone(rf.log[logStartIndex+1 : logEndIndex+1])
+		// if time.Since(start) > time.Second {
+		// 	fmt.Printf("server:%d applycond wait cost:%v commitIndex=%d lastApplied=%d\n",
+		// 		rf.me, time.Since(start), rf.commitIndex, rf.lastApplied)
+		// }
+		msgs := []raftapi.ApplyMsg{}
+		if rf.snapshot != nil && rf.lastApplied < rf.log[0].Index {
+			msgs = append(msgs, raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.snapshot,
+				SnapshotTerm:  rf.log[0].Term,
+				SnapshotIndex: rf.log[0].Index,
+			})
+			rf.lastApplied = rf.log[0].Index
+			// fmt.Printf("log:%d, commit from start cost:%v\n", rf.log[0].Index, time.Since(rf.log[0].StartTime))
+		}
+		logStartIndex := rf.lastApplied - rf.log[0].Index
+		logEndIndex := rf.commitIndex - rf.log[0].Index
+		// if logStartIndex < 0 {
+		// 	if rf.snapshot != nil {
+		// 		fmt.Printf("logstartIndex less than 0, lastApplied:%d, log 0 index:%d, snap lastIncludeLogIndex:%d", rf.lastApplied, rf.log[0].Index, rf.snapshot.LastIncludeLogIndex)
+		// 	} else {
+		// 		fmt.Printf("logstartIndex less than 0, lastApplied:%d, log 0 index:%d", rf.lastApplied, rf.log[0].Index)
+		// 	}
+		// }
+		for i := logStartIndex + 1; i <= logEndIndex; i++ {
+			msgs = append(msgs, raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Command,
+				CommandIndex: rf.log[i].Index,
+			})
+			// fmt.Printf("log:%d, commit from start cost:%v\n", rf.log[i].Index, time.Since(rf.log[i].StartTime))
+		}
 		rf.lastApplied = rf.commitIndex
 		rf.mu.Unlock()
-		for i := logStartIndex + 1; i <= logEndIndex; i++ {
-			rf.applyCh <- raftapi.ApplyMsg{
-				CommandValid: true,
-				Command:      copyLog[i-logStartIndex-1].Command,
-				CommandIndex: int(i),
-			}
-			tester.Annotate(fmt.Sprintf("Server %d", rf.me), "commit log", fmt.Sprintf("logindex:%d", i))
+		for _, msg := range msgs {
+			rf.applyCh <- msg
+			tester.Annotate(fmt.Sprintf("Server %d", rf.me), "commit log", fmt.Sprintf("logindex:%d, snapshot:%d-%d", msg.CommandIndex, msg.SnapshotIndex, msg.SnapshotTerm))
 		}
+		// if time.Since(start) > time.Second {
+		// 	fmt.Printf("applyLog cost:%v\n", time.Since(start))
+		// }
 		rf.mu.Lock()
 	}
 
 }
 
-func (rf *Raft) updateCommitIndexWithLocked(logIndex uint64) {
-	for i := int(logIndex - rf.log[0].Index); i >= 0; i-- {
+func (rf *Raft) updateCommitIndexWithLocked(logIndex int) {
+	for i := logIndex - rf.log[0].Index; i >= 0; i-- {
 		if rf.log[i].Term != rf.currentTerm {
 			continue
 		}
@@ -508,15 +665,17 @@ func (rf *Raft) updateCommitIndexWithLocked(logIndex uint64) {
 			}
 		}
 		if matchCount > len(rf.peers)/2 && rf.log[i].Index > rf.commitIndex {
+			// fmt.Printf("server:%d update commit:%d, since:%v\n", rf.me, rf.log[i].Index, time.Since(rf.startTime))
 			rf.commitIndex = rf.log[i].Index
 			rf.applyCond.Signal()
+			rf.sendHeatbeatWithLocked(true)
 			break
 		}
 
 	}
 }
 
-func (rf *Raft) getLastConflictTermWithLocked(term uint64) int {
+func (rf *Raft) getLastConflictTermWithLocked(term int) int {
 	for i := len(rf.log) - 1; i >= 0; i-- {
 		if rf.log[i].Term == term {
 			return i
@@ -528,18 +687,23 @@ func (rf *Raft) getLastConflictTermWithLocked(term uint64) int {
 	return -1
 }
 
-func (rf *Raft) sendHeatbeatWithLocked() {
+func (rf *Raft) sendHeatbeatWithLocked(force bool) {
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
-		if rf.nextIndex[peer] > rf.log[len(rf.log)-1].Index && time.Since(rf.lastSendAppendEntry[peer]) < 100*time.Millisecond {
+		if !force && rf.nextIndex[peer]+2 > rf.log[len(rf.log)-1].Index && time.Since(rf.lastSendAppendEntry[peer]) < 100*time.Millisecond {
+			continue
+		}
+		if rf.snapshot != nil && rf.nextIndex[peer] <= rf.log[0].Index {
+			// rf.lastSendAppendEntry[peer] = time.Now()
+			go rf.reqeustInstallSnapshot(peer)
 			continue
 		}
 		logBeginIndex := rf.nextIndex[peer] - rf.log[0].Index
-		if logBeginIndex-1 >= uint64(len(rf.log)) {
-			fmt.Printf("nextIndex:%d, log 0 index:%d, log len:%d", rf.nextIndex[peer], rf.log[0].Index, len(rf.log))
-		}
+		// if logBeginIndex-1 >= len(rf.log) {
+		// 	fmt.Printf("nextIndex:%d, log 0 index:%d, log len:%d", rf.nextIndex[peer], rf.log[0].Index, len(rf.log))
+		// }
 		preLog := rf.log[logBeginIndex-1]
 		args := AppendEntryArgs{
 			Term:         rf.currentTerm,
@@ -550,7 +714,6 @@ func (rf *Raft) sendHeatbeatWithLocked() {
 		}
 		if rf.nextIndex[peer] <= rf.log[len(rf.log)-1].Index {
 			args.Entries = append(args.Entries, rf.log[logBeginIndex:]...)
-			rf.nextIndex[peer] = rf.log[len(rf.log)-1].Index + 1
 		}
 		rf.lastSendAppendEntry[peer] = time.Now()
 		go func(server int, args AppendEntryArgs) {
@@ -563,22 +726,23 @@ func (rf *Raft) sendHeatbeatWithLocked() {
 			}
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			if args.Term != rf.currentTerm || rf.state != Leader {
+			if args.Term != rf.currentTerm || rf.state != Leader || args.PrevLogIndex+1 < rf.nextIndex[server] {
 				tester.Annotate(fmt.Sprintf("Server %d", rf.me), "term or state changed", fmt.Sprintf("append entry reply: %v, from:%d, term:%d-%d-%d, state:%d", reply, server, rf.currentTerm, args.Term, reply.Term, rf.state))
 				return
 			}
 			if reply.Success {
-				if len(args.Entries) > 0 {
-					rf.matchIndex[server] = args.Entries[len(args.Entries)-1].Index
+				lastIndex := args.PrevLogIndex + len(args.Entries)
+				if lastIndex > rf.matchIndex[server] {
+					rf.matchIndex[server] = lastIndex
+					rf.nextIndex[server] = lastIndex + 1
 					rf.updateCommitIndexWithLocked(rf.matchIndex[server])
 				}
 			} else {
 				if reply.Term > rf.currentTerm {
 					rf.checkAndMaySetTermAndStateWithLocked(reply.Term)
 				} else {
-					preIndex := args.PrevLogIndex - rf.log[0].Index
-					if reply.XLen < int(preIndex) {
-						rf.nextIndex[server] = rf.log[0].Index + uint64(reply.XLen)
+					if reply.XTerm == -1 {
+						rf.nextIndex[server] = reply.XLen + 1
 					} else {
 						conflictLogIndex := rf.getLastConflictTermWithLocked(reply.XTerm)
 						if conflictLogIndex == -1 {
@@ -588,6 +752,7 @@ func (rf *Raft) sendHeatbeatWithLocked() {
 						}
 					}
 					tester.Annotate(fmt.Sprintf("Server %d", rf.me), "set preLog", fmt.Sprintf("server:%d args:%+v, reply:%+v, nextIndex:%v", server, args, reply, rf.nextIndex[server]))
+					// fmt.Printf("server:%d, back nextIndex server:%d args:%+v, reply:%+v, nextIndex:%v, since:%v\n", rf.me, server, args, reply, rf.nextIndex[server], time.Since(rf.startTime))
 				}
 			}
 			// tester.Annotate(fmt.Sprintf("Server %d", rf.me), "send append entry total cost time", fmt.Sprintf("send append entry cost:%v", time.Since(start)))
@@ -600,11 +765,15 @@ func (rf *Raft) heatbeat() {
 	for true {
 		rf.mu.Lock()
 		if rf.state == Leader {
-			rf.sendHeatbeatWithLocked()
+			rf.sendHeatbeatWithLocked(false)
 		}
 		rf.mu.Unlock()
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func (rf *Raft) resetElectTimeoutWithLocked() {
+	rf.electionTimeout = time.Duration(300+rand.Intn(200)) * time.Millisecond
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -631,27 +800,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.votedFor = -1
 	rf.lastSendAppendEntry = make([]time.Time, len(rf.peers))
-	rf.nextIndex = make([]uint64, len(rf.peers))
-	rf.matchIndex = make([]uint64, len(rf.peers))
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 	for server := range peers {
 		rf.nextIndex[server] = 1
 		rf.matchIndex[server] = 0
 	}
 	rf.applyCh = applyCh
-	rf.electionTimeout = time.Duration(300+rand.Intn(200)) * time.Millisecond
+	rf.resetElectTimeoutWithLocked()
 	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.snapshot = nil
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.snapshot = persister.ReadSnapshot()
 	if len(rf.log) == 0 {
+		term := 0
+		index := 0
 		rf.log = make([]LogEntry, 1)
 		rf.log[0] = LogEntry{
-			Term:    0,
-			Index:   0,
+			Term:    term,
+			Index:   index,
 			Command: nil,
 		}
-		rf.persist()
 	}
+	rf.startTime = time.Now()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
