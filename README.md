@@ -117,7 +117,7 @@ info: wrote visualization to /tmp/porcupine-3121644360.html
 commitindex更新之后也要发送AppendEntry
 需要平衡消息条数和同步commit的耗时，写入数据后立即发送AppendEntry会导致RPC过多（TestCount3B用例失败）
 ```
-
+### 测试结果
 ```
 === 第 25 次执行 make raft1 ===
 go build -race -o main/raft1d main/raft1d.go
@@ -243,4 +243,140 @@ Test (3D): snapshot initialization after crash (unreliable network)...
 --- PASS: TestSnapshotInit3D (5.83s)
 PASS
 ok      6.5840/raft1    578.623s
+```
+
+## Lab4 kvraft1
+### 遇到得问题
+```
+问题：TestSpeed4B 失败
+kvraft_test.go:162: Operations completed too slowly 37.002908ms/op > 33.333333ms/op
+定位以及结论：
+1000条日志persist要30ms。耗时主要在encode上
+encode cost:25.389993ms, size:95710
+关掉 `RACE=-race`，耗时最大只有2ms。。。
+后面得用例关掉race测试
+```
+
+```
+问题：用例有卡住没有返回得场景
+方案：需要注意applych通知过来得commitindex可能比当前正在等待的commitindex要大，这些等待的都是已经失效的Leader上的写入。需要返回ErrWrongLeader让客户端重试。
+```
+
+### 测试结果
+```
+=== 第 30 次执行 make kvraft1 ===
+go build  -o main/kvraft1d main/kvraft1d.go
+cd kvraft1 && go test -v   
+=== RUN   TestBasic4B
+Test: one client (4B basic) (reliable network)...
+  ... Passed --  time  3.1s #peers 5 #RPCs  3419 #Ops  714
+--- PASS: TestBasic4B (3.70s)
+=== RUN   TestSpeed4B
+Test: one client (4B speed) (reliable network)...
+2026/08/19 20:15:30 dur 7.724263ms 33.333333ms
+2026/08/19 20:15:30 0: 137
+2026/08/19 20:15:30 1: 656
+2026/08/19 20:15:30 2: 196
+2026/08/19 20:15:30 3: 9
+2026/08/19 20:15:30 4: 1
+2026/08/19 20:15:30 6: 1
+  ... Passed --  time  8.2s #peers 3 #RPCs  5598 #Ops 1002
+--- PASS: TestSpeed4B (8.58s)
+=== RUN   TestConcurrent4B
+Test: many clients (4B many clients) (reliable network)...
+  ... Passed --  time  3.5s #peers 5 #RPCs  5318 #Ops  974
+--- PASS: TestConcurrent4B (4.10s)
+=== RUN   TestUnreliable4B
+Test: many clients (4B many clients) (unreliable network)...
+  ... Passed --  time  4.6s #peers 5 #RPCs  2584 #Ops  430
+--- PASS: TestUnreliable4B (5.41s)
+=== RUN   TestOnePartition4B
+Test: one client (4B progress in majority) (unreliable network)...
+k:1-v:13 version:1 agreed
+=========begin put, p1:[1 2 3], p2:[4 0]
+  ... Passed --  time  1.4s #peers 5 #RPCs   148 #Ops    4
+Test: no progress in minority (4B) (unreliable network)...
+  ... Passed --  time  1.3s #peers 5 #RPCs   135 #Ops    7
+Test: completion after heal (4B) (unreliable network)...
+  ... Passed --  time  1.1s #peers 5 #RPCs    80 #Ops    4
+2026/08/19 20:15:44 QqKdLbq4swx7mXSek1wQ: dmxsrv.reader: clnt 2ZRoIrs87FZCvBRptybp ReadCall err read unix /tmp/6.5840-QqKdLbq4swx7mXSek1wQ->@: read: connection reset by peer
+--- PASS: TestOnePartition4B (4.51s)
+=== RUN   TestManyPartitionsOneClient4B
+Test: partitions, one client (4B partitions, one client) (reliable network)...
+  ... Passed --  time 11.5s #peers 5 #RPCs  3834 #Ops  706
+--- PASS: TestManyPartitionsOneClient4B (12.27s)
+=== RUN   TestManyPartitionsManyClients4B
+Test: partitions, many clients (4B partitions, many clients (4B)) (reliable network)...
+  ... Passed --  time 10.3s #peers 5 #RPCs  4469 #Ops 1006
+--- PASS: TestManyPartitionsManyClients4B (10.88s)
+=== RUN   TestPersistOneClient4B
+Test: restarts, one client (4B restarts, one client 4B ) (reliable network)...
+  ... Passed --  time  8.4s #peers 5 #RPCs  3487 #Ops  518
+--- PASS: TestPersistOneClient4B (9.10s)
+=== RUN   TestPersistConcurrent4B
+Test: restarts, many clients (4B restarts, many clients) (reliable network)...
+2026/08/19 20:16:21 a6d45y1qEmYhQZt1TrXP: dmxsrv.reader: clnt Gfcve6P3lcD8EPWa8A_Q ReadCall err read unix /tmp/6.5840-a6d45y1qEmYhQZt1TrXP->@: read: connection reset by peer
+  ... Passed --  time  8.6s #peers 5 #RPCs  3886 #Ops  830
+--- PASS: TestPersistConcurrent4B (9.38s)
+=== RUN   TestPersistConcurrentUnreliable4B
+Test: restarts, many clients (4B restarts, many clients ) (unreliable network)...
+  ... Passed --  time  9.2s #peers 5 #RPCs  2312 #Ops  382
+--- PASS: TestPersistConcurrentUnreliable4B (9.91s)
+=== RUN   TestPersistPartition4B
+Test: restarts, partitions, many clients (4B restarts, partitions, many clients) (reliable network)...
+  ... Passed --  time 14.8s #peers 5 #RPCs  4979 #Ops  730
+--- PASS: TestPersistPartition4B (15.49s)
+=== RUN   TestPersistPartitionUnreliable4B
+Test: restarts, partitions, many clients (4B restarts, partitions, many clients) (unreliable network)...
+  ... Passed --  time 15.6s #peers 5 #RPCs  2634 #Ops  406
+--- PASS: TestPersistPartitionUnreliable4B (16.18s)
+=== RUN   TestPersistPartitionUnreliableLinearizable4B
+Test: restarts, partitions, random keys, many clients (4B restarts, partitions, random keys, many clients) (unreliable network)...
+  ... Passed --  time 17.4s #peers 7 #RPCs  5320 #Ops  560
+--- PASS: TestPersistPartitionUnreliableLinearizable4B (18.66s)
+=== RUN   TestSnapshotRPC4C
+Test: snapshots, one client (4C SnapshotsRPC) (reliable network)...
+Test: InstallSnapshot RPC (4C) (reliable network)...
+  ... Passed --  time  2.6s #peers 3 #RPCs   957 #Ops   71
+--- PASS: TestSnapshotRPC4C (2.93s)
+=== RUN   TestSnapshotSize4C
+Test: snapshots, one client (4C snapshot size is reasonable) (reliable network)...
+  ... Passed --  time  3.8s #peers 3 #RPCs  4266 #Ops 1200
+--- PASS: TestSnapshotSize4C (4.36s)
+=== RUN   TestSpeed4C
+Test: snapshots, one client (4C speed) (reliable network)...
+2026/08/19 20:17:39 dur 5.265612ms 33.333333ms
+2026/08/19 20:17:39 0: 526
+2026/08/19 20:17:39 1: 461
+2026/08/19 20:17:39 2: 13
+  ... Passed --  time  5.7s #peers 3 #RPCs  5589 #Ops 1002
+--- PASS: TestSpeed4C (6.01s)
+=== RUN   TestSnapshotRecover4C
+Test: restarts, snapshots, one client (4C restarts, snapshots, one client) (reliable network)...
+2026/08/19 20:17:41 rcgre67q5VO82SVlKeZt: dmxsrv.reader: clnt Bc3hG8NnNeStF8byZDv4 ReadCall err read unix /tmp/6.5840-rcgre67q5VO82SVlKeZt->@: read: connection reset by peer
+  ... Passed --  time  7.9s #peers 5 #RPCs  3802 #Ops  666
+--- PASS: TestSnapshotRecover4C (8.68s)
+=== RUN   TestSnapshotRecoverManyClients4C
+Test: restarts, snapshots, many clients (4C restarts, snapshots, many clients ) (reliable network)...
+  ... Passed --  time 15.3s #peers 5 #RPCs 23528 #Ops 2854
+--- PASS: TestSnapshotRecoverManyClients4C (15.97s)
+=== RUN   TestSnapshotUnreliable4C
+Test: snapshots, many clients (4C unreliable net, snapshots, many clients) (unreliable network)...
+  ... Passed --  time  4.5s #peers 5 #RPCs  2984 #Ops  474
+--- PASS: TestSnapshotUnreliable4C (5.20s)
+=== RUN   TestSnapshotUnreliableRecover4C
+Test: restarts, snapshots, many clients (4C unreliable net, restarts, snapshots, many clients) (unreliable network)...
+2026/08/19 20:18:14 4Dq36LjqdNYPFl7Hikcl: dmxsrv.reader: clnt yllHNK5goj3lGs5JTByL ReadCall err read unix /tmp/6.5840-4Dq36LjqdNYPFl7Hikcl->@: read: connection reset by peer
+  ... Passed --  time  9.1s #peers 5 #RPCs  2770 #Ops  406
+--- PASS: TestSnapshotUnreliableRecover4C (9.82s)
+=== RUN   TestSnapshotUnreliableRecoverConcurrentPartition4C
+Test: restarts, partitions, snapshots, many clients (4C unreliable net, restarts, partitions, snapshots, many clients) (unreliable network)...
+  ... Passed --  time 15.3s #peers 5 #RPCs  2897 #Ops  382
+--- PASS: TestSnapshotUnreliableRecoverConcurrentPartition4C (16.15s)
+=== RUN   TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable4C
+Test: restarts, partitions, snapshots, random keys, many clients (4C unreliable net, restarts, partitions, snapshots, random keys, many clients) (unreliable network)...
+  ... Passed --  time 15.4s #peers 7 #RPCs  6416 #Ops  620
+--- PASS: TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable4C (16.53s)
+PASS
+ok      6.5840/kvraft1  213.838s
 ```

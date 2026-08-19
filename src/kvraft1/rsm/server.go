@@ -8,7 +8,7 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
 	"6.5840/labrpc"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Inc struct {
@@ -59,7 +59,6 @@ func (rs *rsmSrv) GetCounter() int {
 }
 
 func (rs *rsmSrv) DoOp(req any) any {
-	//log.Printf("%d: DoOp: %T(%v)", rs.me, req, req)
 	switch req.(type) {
 	case Inc:
 		rs.mu.Lock()

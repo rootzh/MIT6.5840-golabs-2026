@@ -1,12 +1,14 @@
 package kvsrv
 
 import (
+	"bytes"
 	"log"
 	"sync"
 
 	"6.5840/kvsrv1/rpc"
+	"6.5840/labgob"
 	"6.5840/labrpc"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 const Debug = false
@@ -19,7 +21,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type Element struct {
-	Value string
+	Value   string
 	Version rpc.Tversion
 }
 
@@ -66,25 +68,50 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	reply.Err = rpc.OK
 	element, exist := kv.data[args.Key]
 	if !exist {
-		if (args.Version != 0) {
+		if args.Version != 0 {
 			reply.Err = rpc.ErrNoKey
 			return
 		}
-		kv.data[args.Key] = &Element {
-			Value : args.Value,
-			Version : 1,
+		kv.data[args.Key] = &Element{
+			Value:   args.Value,
+			Version: 1,
 		}
 		return
 	}
-	if (element.Version != args.Version) {
+	if element.Version != args.Version {
 		reply.Err = rpc.ErrVersion
 		return
 	}
 	kv.data[args.Key].Value = args.Value
-	kv.data[args.Key].Version += 1;
+	kv.data[args.Key].Version += 1
 }
 
+func (kv *KVServer) Snapshot() []byte {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	return w.Bytes()
+}
+
+func (kv *KVServer) Restore(data []byte) {
+	if len(data) < 1 {
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var kvData map[string]*Element
+	if d.Decode(&kvData) != nil {
+		log.Fatalf("data:%v, decode fail", data)
+	} else {
+		kv.data = kvData
+	}
+}
 
 // You can ignore all arguments; they are for replicated KVservers
 func StartKVServer(tc *tester.TesterClnt, ends []*labrpc.ClientEnd, gid tester.Tgid, srv int, persister *tester.Persister) []any {
